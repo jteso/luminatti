@@ -1,0 +1,38 @@
+name: Desktop preview feedback
+description: Tell us how the Luminatti Review macOS preview worked for you.
+title: "[Desktop preview]: "
+labels: ["desktop-preview", "feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying the preview. Short, concrete feedback is especially useful.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What are you reporting?
+      options:
+        - Something I liked
+        - Something confusing or missing
+        - A bug or crash
+        - An update or installation problem
+    validations:
+      required: true
+  - type: textarea
+    id: experience
+    attributes:
+      label: What happened?
+      description: Include the repository type and the steps you took, but never paste secrets.
+      placeholder: I opened ..., then ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Luminatti Review version
+      description: Shown on the release you installed, or in the app bundle's Info panel.
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac type
+      placeholder: macOS 15.5, Apple Silicon
