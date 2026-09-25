@@ -71,12 +71,11 @@ GitHub Actions builds the binaries and macOS app and creates the GitHub release.
 To publish the crate as well, set `PUBLISH_CRATE=true` and configure crates.io
 credentials in the `release` environment.
 
-All Rust dependencies come from crates.io and are pinned in `Cargo.lock`.
-No sibling checkout or other local project is required. Icons are embedded in
-the executable. GPUI's `font-kit` feature supplies text rendering, and
-`runtime_shaders` supports building with Apple's Command Line Tools.
-The optional Radar helper builds from `tools/radar-layout` in this repository;
-its Go dependencies are downloaded by Go.
+Luminatti builds directly from this repository. Rust dependencies come from
+crates.io and are pinned in `Cargo.lock`. Icons are embedded in the executable.
+GPUI's `font-kit` feature supplies text rendering, and `runtime_shaders`
+supports building with Apple's Command Line Tools. The optional Radar helper
+builds from `tools/radar-layout`; its Go dependencies are downloaded by Go.
 
 The executable is `luminatti`. Configuration uses `luminatti.config.json`,
 `~/.config/luminatti/`, and `LUMINATTI_*` environment variables. Desktop state lives
