@@ -67,9 +67,9 @@ For the native desktop workspace on macOS:
 
 Pushing any `vX.Y.Z` tag whose commit is on `origin/main` starts the release
 workflow. The tag must match the versions in `Cargo.toml` and `Cargo.lock`.
-GitHub Actions builds the binaries and macOS app, creates the GitHub release,
-and publishes the crate. The `release` environment must allow `v*` tags and
-have its publishing credentials configured.
+GitHub Actions builds the binaries and macOS app and creates the GitHub release.
+To publish the crate as well, set `PUBLISH_CRATE=true` and configure crates.io
+credentials in the `release` environment.
 
 All Rust dependencies come from crates.io and are pinned in `Cargo.lock`.
 No sibling checkout or other local project is required. Icons are embedded in

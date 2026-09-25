@@ -1,5 +1,5 @@
-# Release workflow: builds macOS + Linux binaries, creates a GitHub release,
-# and publishes to crates.io.
+# Release workflow: builds macOS + Linux binaries and creates a GitHub release.
+# crates.io publishing is optional and enabled with PUBLISH_CRATE=true.
 #
 # Push a vX.Y.Z tag pointing to a commit on origin/main to start a release.
 # ./release.sh prepares the version commit and pushes the tag in that order.
@@ -195,6 +195,13 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
+      - name: Install Go for Radar helper
+        run: |
+          if ! command -v go >/dev/null 2>&1; then
+            brew install go
+          fi
+          go version
+
       - name: Build Luminatti app bundle and zip
         run: bash scripts/build-macos-app.sh --zip
 
@@ -299,6 +306,7 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
+    if: ${{ vars.PUBLISH_CRATE == 'true' }}
     needs: [prepare, build]
     runs-on: ubuntu-latest
     environment: release
