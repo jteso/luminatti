@@ -26,6 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
+use sha2::{Digest, Sha256};
 
 use git2::{BranchType, Repository, StatusOptions};
 use globset::GlobMatcher;
@@ -327,6 +328,21 @@ fn observed_at_millis(path: &Path) -> u128 {
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+fn reviewed_fingerprint(root: &Path, path: &str, status: crate::command::diff::types::FileStatus, commit_id: &str) -> Option<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(commit_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(status.symbol().as_bytes());
+    hasher.update([0]);
+    match std::fs::read(root.join(path)) {
+        Ok(contents) => hasher.update(contents),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+            && status == crate::command::diff::types::FileStatus::Deleted => hasher.update(b"deleted"),
+        Err(_) => return None,
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn load_typescript_analyses(
@@ -672,6 +688,7 @@ struct ReviewWorkspace {
     repository_root: PathBuf,
     reference: Option<CommitReference>,
     sidebar_width: Pixels,
+    reviewed_panel_height: Pixels,
     filtered_panel_height: Pixels,
     annotation_width: Pixels,
     outline_width: Pixels,
@@ -684,9 +701,16 @@ struct ReviewWorkspace {
     file_view: FileView,
     show_only_changes: bool,
     hide_deleted_entries: bool,
+    hide_reviewed_files: bool,
+    files_section_expanded: bool,
+    reviewed_section_expanded: bool,
+    ignored_section_expanded: bool,
+    reviewed_section_preference_set: bool,
+    ignored_section_preference_set: bool,
     show_file_view_menu: bool,
     collapsed_directories: HashSet<String>,
-    reviewed_files: HashSet<String>,
+    reviewed_collapsed_directories: HashSet<String>,
+    reviewed_files: HashMap<String, String>,
     change_type_filters: HashSet<view::ReviewChangeFamily>,
     context_paths: HashSet<String>,
     /// Glob patterns shared by Changes, the semantic summary, and Radar.
@@ -700,6 +724,7 @@ struct ReviewWorkspace {
     diff_list_scroll: UniformListScrollHandle,
     unified_diff_scroll: UniformListScrollHandle,
     selected_change: usize,
+    change_navigation_active: bool,
     collapsed_unchanged_sections: HashSet<UnchangedSection>,
     hide_unchanged_sections: bool,
     drag: Option<DragKind>,
@@ -759,6 +784,7 @@ struct SidebarFileEntry {
 #[derive(Clone, Copy)]
 enum DragKind {
     Sidebar { start: Pixels, width: Pixels },
+    ReviewedPanel { start: Pixels, height: Pixels },
     FilteredPanel { start: Pixels, height: Pixels },
     Annotations { start: Pixels, width: Pixels },
     Outline { start: Pixels, width: Pixels },
@@ -853,6 +879,7 @@ impl ReviewWorkspace {
             repository_root,
             reference,
             sidebar_width: px(272.),
+            reviewed_panel_height: px(160.),
             filtered_panel_height: px(180.),
             annotation_width: px(300.),
             outline_width: px(280.),
@@ -865,9 +892,16 @@ impl ReviewWorkspace {
             file_view: FileView::CompactTree,
             show_only_changes: true,
             hide_deleted_entries: false,
+            hide_reviewed_files: false,
+            files_section_expanded: true,
+            reviewed_section_expanded: false,
+            ignored_section_expanded: false,
+            reviewed_section_preference_set: false,
+            ignored_section_preference_set: false,
             show_file_view_menu: false,
             collapsed_directories: HashSet::new(),
-            reviewed_files: HashSet::new(),
+            reviewed_collapsed_directories: HashSet::new(),
+            reviewed_files: HashMap::new(),
             change_type_filters: HashSet::new(),
             context_paths: HashSet::new(),
             file_filters: Vec::new(),
@@ -880,6 +914,7 @@ impl ReviewWorkspace {
             diff_list_scroll: UniformListScrollHandle::new(),
             unified_diff_scroll: UniformListScrollHandle::new(),
             selected_change: 0,
+            change_navigation_active: false,
             collapsed_unchanged_sections: HashSet::new(),
             hide_unchanged_sections: false,
             drag: None,
@@ -921,6 +956,7 @@ impl ReviewWorkspace {
     fn saved_workspace_state(&self) -> WorkspaceState {
         WorkspaceState {
             sidebar_width: Some(f32::from(self.sidebar_width).max(0.) as u32),
+            reviewed_panel_height: Some(f32::from(self.reviewed_panel_height).max(0.) as u32),
             filtered_panel_height: Some(f32::from(self.filtered_panel_height).max(0.) as u32),
             annotation_width: Some(f32::from(self.annotation_width).max(0.) as u32),
             outline_width: Some(f32::from(self.outline_width).max(0.) as u32),
@@ -932,8 +968,15 @@ impl ReviewWorkspace {
             file_view: self.file_view,
             show_only_changes: self.show_only_changes,
             hide_deleted_entries: self.hide_deleted_entries,
+            hide_reviewed_files: self.hide_reviewed_files,
+            files_section_expanded: self.files_section_expanded,
+            reviewed_section_expanded: self.reviewed_section_expanded,
+            ignored_section_expanded: self.ignored_section_expanded,
+            reviewed_section_preference_set: self.reviewed_section_preference_set,
+            ignored_section_preference_set: self.ignored_section_preference_set,
             show_file_filter: self.show_file_filter,
             collapsed_directories: self.collapsed_directories.iter().cloned().collect(),
+            reviewed_collapsed_directories: self.reviewed_collapsed_directories.iter().cloned().collect(),
             change_type_filters: self.change_type_filters.iter().copied().collect(),
             file_filters: self.file_filters.clone(),
             hide_unchanged_sections: self.hide_unchanged_sections,
@@ -958,7 +1001,8 @@ impl ReviewWorkspace {
                 .get(self.model.selected)
                 .map(|file| file.path.clone()),
             selected_change: self.selected_change,
-            reviewed_files: self.reviewed_files.iter().cloned().collect(),
+            reviewed_files: Default::default(),
+            reviewed: self.reviewed_files.iter().map(|(path, fingerprint)| (path.clone(), fingerprint.clone())).collect(),
             radar_open: self.radar.open,
             radar_active: self.radar.active,
             radar_expand_all: self.radar.expand_all,
@@ -991,6 +1035,7 @@ impl ReviewWorkspace {
     fn restore_project_settings(&mut self, explicit_focus: Option<&str>, cx: &mut Context<Self>) {
         let state = self.project_settings.workspace(&self.repository_root);
         self.sidebar_width = px(state.sidebar_width.unwrap_or(272) as f32);
+        self.reviewed_panel_height = px(state.reviewed_panel_height.unwrap_or(160).clamp(80, 500) as f32);
         self.filtered_panel_height = px(state.filtered_panel_height.unwrap_or(180).clamp(80, 500) as f32);
         self.annotation_width = px(state.annotation_width.unwrap_or(300).clamp(220, 480) as f32);
         self.outline_width = px(state.outline_width.unwrap_or(280).clamp(220, 480) as f32);
@@ -1002,8 +1047,18 @@ impl ReviewWorkspace {
         self.file_view = state.file_view;
         self.show_only_changes = state.show_only_changes;
         self.hide_deleted_entries = state.hide_deleted_entries;
+        self.hide_reviewed_files = state.hide_reviewed_files;
+        self.files_section_expanded = state.files_section_expanded;
+        // Older workspace files saved expanded defaults even when the user
+        // never touched these sections. Only explicit choices override the
+        // new collapsed default.
+        self.reviewed_section_preference_set = state.reviewed_section_preference_set;
+        self.ignored_section_preference_set = state.ignored_section_preference_set;
+        self.reviewed_section_expanded = state.reviewed_section_preference_set && state.reviewed_section_expanded;
+        self.ignored_section_expanded = state.ignored_section_preference_set && state.ignored_section_expanded;
         self.show_file_filter = state.show_file_filter;
         self.collapsed_directories = state.collapsed_directories.into_iter().collect();
+        self.reviewed_collapsed_directories = state.reviewed_collapsed_directories.into_iter().collect();
         self.change_type_filters = state.change_type_filters.into_iter().collect();
         self.file_filters.clear();
         self.file_filter_matchers.clear();
@@ -1016,7 +1071,18 @@ impl ReviewWorkspace {
         self.hide_unchanged_sections = state.hide_unchanged_sections;
         self.collapsed_unchanged_sections = state.collapsed_unchanged_sections.into_iter().collect();
         self.selected_change = state.selected_change;
-        self.reviewed_files = state.reviewed_files.into_iter().collect();
+        self.reviewed_files = state.reviewed.into_iter().filter(|(path, fingerprint)| {
+            self.model.files.iter().find(|file| &file.path == path).and_then(|file| {
+                reviewed_fingerprint(&self.repository_root, path, file.status, &self.commit_id)
+            }).as_ref() == Some(fingerprint)
+        }).collect();
+        for path in state.reviewed_files {
+            if let Some(file) = self.model.files.iter().find(|file| file.path == path) {
+                if let Some(fingerprint) = reviewed_fingerprint(&self.repository_root, &path, file.status, &self.commit_id) {
+                    self.reviewed_files.entry(path).or_insert(fingerprint);
+                }
+            }
+        }
         self.radar.open = state.radar_open;
         self.radar.active = state.radar_open && state.radar_active && explicit_focus.is_none();
         self.radar.expand_all = state.radar_expand_all;
@@ -1081,6 +1147,11 @@ impl ReviewWorkspace {
         branch_name: String,
         cx: &mut Context<Self>,
     ) {
+        self.reviewed_files.retain(|path, fingerprint| {
+            files.iter().find(|file| &file.path == path).and_then(|file| {
+                reviewed_fingerprint(&self.repository_root, path, file.status, &commit_id)
+            }).as_ref() == Some(fingerprint)
+        });
         // Refreshes start with lightweight file summaries. Retain the last
         // known stats until the background numstat task supplies fresh values,
         // avoiding a visible +0/-0 flash on every filesystem event.
@@ -1112,11 +1183,14 @@ impl ReviewWorkspace {
         self.branch_name = branch_name;
         self.refresh_branch_status();
         self.selected_change = 0;
+        self.change_navigation_active = false;
         self.collapsed_unchanged_sections.clear();
         self.rebuild_active_file();
         self.request_lsp_for_active_file();
         self.diff_list_scroll
             .scroll_to_item_strict(0, ScrollStrategy::Top);
+        self.unified_diff_scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
+        self.persist_project_settings();
         self.model_revision = self.model_revision.wrapping_add(1);
         cx.notify();
     }
@@ -1502,6 +1576,7 @@ impl ReviewWorkspace {
         self.active_file = None;
         self.active_file_load = None;
         self.sidebar_width = px(272.);
+        self.reviewed_panel_height = px(160.);
         self.annotation_width = px(300.);
         self.outline_width = px(280.);
         self.diff_left_width = px(520.);
@@ -1512,7 +1587,14 @@ impl ReviewWorkspace {
         self.file_view = FileView::CompactTree;
         self.show_only_changes = true;
         self.hide_deleted_entries = false;
+        self.hide_reviewed_files = false;
+        self.files_section_expanded = true;
+        self.reviewed_section_expanded = false;
+        self.ignored_section_expanded = false;
+        self.reviewed_section_preference_set = false;
+        self.ignored_section_preference_set = false;
         self.collapsed_directories.clear();
+        self.reviewed_collapsed_directories.clear();
         self.change_type_filters.clear();
         self.file_filters.clear();
         self.file_filter_matchers.clear();
@@ -1524,6 +1606,7 @@ impl ReviewWorkspace {
         self.show_branch_menu = false;
         self.show_settings_menu = false;
         self.selected_change = 0;
+        self.change_navigation_active = false;
         self.collapsed_unchanged_sections.clear();
         self.hide_unchanged_sections = false;
         self.diff_list_scroll
@@ -1842,6 +1925,7 @@ impl ReviewWorkspace {
         if changed_file {
             self.unified_diff_scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
             self.selected_change = 0;
+            self.change_navigation_active = false;
             self.diff_list_scroll
                 .scroll_to_item_strict(0, ScrollStrategy::Top);
         }
@@ -1995,6 +2079,7 @@ impl ReviewWorkspace {
                         || self.model.files[*index].status
                             != crate::command::diff::types::FileStatus::Deleted
                 })
+                .filter(|index| !self.hide_reviewed_files || !self.reviewed_files.contains_key(&self.model.files[*index].path))
                 .filter_map(|index| {
                     self.model.files.get(index).map(|file| SidebarFileEntry {
                         path: file.path.clone(),
@@ -2031,6 +2116,9 @@ impl ReviewWorkspace {
                 {
                     return None;
                 }
+                if self.hide_reviewed_files && self.reviewed_files.contains_key(path) {
+                    return None;
+                }
                 if !self.change_type_filters.is_empty()
                     && !changed_index.is_some_and(|index| {
                         file_matches_change_types(
@@ -2050,16 +2138,33 @@ impl ReviewWorkspace {
             .collect()
     }
 
+    fn reviewed_file_entries(&self) -> Vec<SidebarFileEntry> {
+        self.model.files.iter().enumerate()
+            .filter(|(_, file)| self.reviewed_files.contains_key(&file.path)
+                && !self.context_paths.contains(&file.path))
+            .map(|(index, file)| SidebarFileEntry {
+                path: file.path.clone(),
+                model_index: Some(index),
+                is_changed: true,
+            })
+            .collect()
+    }
+
     fn filtered_out_file_indices(&self) -> Vec<usize> {
         let visible = self.sidebar_file_entries().into_iter().map(|entry| entry.path).collect::<HashSet<_>>();
         self.model.files.iter().enumerate()
-            .filter_map(|(index, file)| (!visible.contains(&file.path) && !self.context_paths.contains(&file.path)).then_some(index))
+            .filter_map(|(index, file)| (!visible.contains(&file.path) && !self.context_paths.contains(&file.path)
+                && (!self.hide_reviewed_files || !self.reviewed_files.contains_key(&file.path))).then_some(index))
             .collect()
     }
 
     fn toggle_file_reviewed(&mut self, path: &str, cx: &mut Context<Self>) {
-        if !self.reviewed_files.insert(path.to_string()) {
+        if self.reviewed_files.contains_key(path) {
             self.reviewed_files.remove(path);
+        } else if let Some(file) = self.model.files.iter().find(|file| file.path == path) {
+            if let Some(fingerprint) = reviewed_fingerprint(&self.repository_root, path, file.status, &self.commit_id) {
+                self.reviewed_files.insert(path.to_string(), fingerprint);
+            }
         }
         self.persist_project_settings();
         cx.notify();
@@ -2070,10 +2175,14 @@ impl ReviewWorkspace {
             .filter(|file| !self.context_paths.contains(&file.path))
             .map(|file| file.path.clone())
             .collect::<Vec<_>>();
-        let all_reviewed = !paths.is_empty() && paths.iter().all(|path| self.reviewed_files.contains(path));
+        let all_reviewed = !paths.is_empty() && paths.iter().all(|path| self.reviewed_files.contains_key(path));
         for path in paths {
             if all_reviewed { self.reviewed_files.remove(&path); }
-            else { self.reviewed_files.insert(path); }
+            else if let Some(file) = self.model.files.iter().find(|file| file.path == path) {
+                if let Some(fingerprint) = reviewed_fingerprint(&self.repository_root, &path, file.status, &self.commit_id) {
+                    self.reviewed_files.insert(path, fingerprint);
+                }
+            }
         }
         self.persist_project_settings();
         cx.notify();
@@ -2113,23 +2222,16 @@ impl ReviewWorkspace {
     }
 
     fn hidden_file_count(&self) -> usize {
-        if self.show_only_changes {
-            self.model
-                .files
-                .iter()
-                .filter(|f| !self.context_paths.contains(&f.path))
-                .count()
-                .saturating_sub(self.filtered_file_indices().len())
-        } else {
-            self.repository_files
-                .len()
-                .saturating_sub(self.sidebar_file_entries().len())
-        }
+        self.filtered_out_file_indices().len()
     }
 
     fn toggle_file_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_file_view_menu = false;
         self.show_file_filter = !self.show_file_filter;
+        if self.show_file_filter {
+            self.ignored_section_expanded = true;
+            self.ignored_section_preference_set = true;
+        }
         self.file_filter_error = None;
         if self.show_file_filter {
             let focus_handle = self.file_filter_input.read(cx).focus_handle().clone();
@@ -2190,13 +2292,24 @@ impl ReviewWorkspace {
             // Changed source rows are never collapsed. Keeping this fallback
             // makes navigation resilient if the display model changes later.
             .unwrap_or(*row);
-        self.diff_list_scroll
-            .scroll_to_item_strict(display_row, ScrollStrategy::Top);
+        if self.diff_view == DiffView::Unified {
+            let unified_row = display_rows_for_file(file, &self.collapsed_unchanged_sections, self.lsp_symbols.get(&file.path).map(Vec::as_slice).unwrap_or(&[]))
+                .iter().take(display_row).filter(|row| matches!(row, DiffDisplayRow::Code { source_row } if matches!(file.rows[*source_row].change, crate::command::diff::types::ChangeType::Modified))).count()
+                + display_row;
+            self.unified_diff_scroll.scroll_to_item_strict(unified_row, ScrollStrategy::Top);
+        } else {
+            self.diff_list_scroll.scroll_to_item_strict(display_row, ScrollStrategy::Top);
+        }
         cx.notify();
     }
 
     fn select_previous_file_change(&mut self, cx: &mut Context<Self>) {
-        if self.selected_change > 0 {
+        if !self.change_navigation_active {
+            self.change_navigation_active = true;
+            self.selected_change = 0;
+            self.scroll_to_selected_change(cx);
+            self.persist_project_settings();
+        } else if self.selected_change > 0 {
             self.selected_change -= 1;
             self.scroll_to_selected_change(cx);
             self.persist_project_settings();
@@ -2207,7 +2320,12 @@ impl ReviewWorkspace {
         let Some(file) = self.selected_file() else {
             return;
         };
-        if self.selected_change + 1 < change_start_rows(&file.rows).len() {
+        if !self.change_navigation_active && !change_start_rows(&file.rows).is_empty() {
+            self.change_navigation_active = true;
+            self.selected_change = 0;
+            self.scroll_to_selected_change(cx);
+            self.persist_project_settings();
+        } else if self.selected_change + 1 < change_start_rows(&file.rows).len() {
             self.selected_change += 1;
             self.scroll_to_selected_change(cx);
             self.persist_project_settings();
@@ -2346,7 +2464,14 @@ impl ReviewWorkspace {
     }
 
     fn start_filtered_panel_drag(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.drag = Some(DragKind::FilteredPanel { start: event.position.y, height: self.filtered_panel_height });
+        let height = if self.ignored_section_expanded { self.filtered_panel_height } else { px(28.) };
+        self.drag = Some(DragKind::FilteredPanel { start: event.position.y, height });
+        cx.notify();
+    }
+
+    fn start_reviewed_panel_drag(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let height = if self.reviewed_section_expanded { self.reviewed_panel_height } else { px(28.) };
+        self.drag = Some(DragKind::ReviewedPanel { start: event.position.y, height });
         cx.notify();
     }
 
@@ -2482,6 +2607,7 @@ impl ReviewWorkspace {
             self.drag,
             Some(
                 DragKind::Sidebar { .. }
+                    | DragKind::ReviewedPanel { .. }
                     | DragKind::FilteredPanel { .. }
                     | DragKind::Annotations { .. }
                     | DragKind::Outline { .. }
@@ -2500,7 +2626,24 @@ impl ReviewWorkspace {
             return;
         }
         match self.drag {
+            Some(DragKind::ReviewedPanel { start, height }) => {
+                if !self.reviewed_section_expanded {
+                    if event.position.y >= start - px(3.) {
+                        return;
+                    }
+                    self.reviewed_section_expanded = true;
+                    self.reviewed_section_preference_set = true;
+                }
+                self.reviewed_panel_height = (height - (event.position.y - start)).clamp(px(80.), (window.viewport_size().height - px(200.)).max(px(80.)));
+            }
             Some(DragKind::FilteredPanel { start, height }) => {
+                if !self.ignored_section_expanded {
+                    if event.position.y >= start - px(3.) {
+                        return;
+                    }
+                    self.ignored_section_expanded = true;
+                    self.ignored_section_preference_set = true;
+                }
                 self.filtered_panel_height = (height - (event.position.y - start)).clamp(px(80.), (window.viewport_size().height - px(200.)).max(px(80.)));
             }
             Some(DragKind::Sidebar { start, width }) => {
@@ -2577,6 +2720,33 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
+    fn toggle_hide_reviewed_files(&mut self, cx: &mut Context<Self>) {
+        self.hide_reviewed_files = !self.hide_reviewed_files;
+        self.show_file_view_menu = false;
+        self.persist_project_settings();
+        cx.notify();
+    }
+
+    fn toggle_files_section(&mut self, cx: &mut Context<Self>) {
+        self.files_section_expanded = !self.files_section_expanded;
+        self.persist_project_settings();
+        cx.notify();
+    }
+
+    fn toggle_reviewed_section(&mut self, cx: &mut Context<Self>) {
+        self.reviewed_section_expanded = !self.reviewed_section_expanded;
+        self.reviewed_section_preference_set = true;
+        self.persist_project_settings();
+        cx.notify();
+    }
+
+    fn toggle_ignored_section(&mut self, cx: &mut Context<Self>) {
+        self.ignored_section_expanded = !self.ignored_section_expanded;
+        self.ignored_section_preference_set = true;
+        self.persist_project_settings();
+        cx.notify();
+    }
+
     fn toggle_change_type_filter(
         &mut self,
         family: view::ReviewChangeFamily,
@@ -2595,9 +2765,14 @@ impl ReviewWorkspace {
         cx.notify();
     }
 
-    fn toggle_directory(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.collapsed_directories.insert(path.clone()) {
-            self.collapsed_directories.remove(&path);
+    fn toggle_directory(&mut self, path: String, reviewed: bool, cx: &mut Context<Self>) {
+        let directories = if reviewed {
+            &mut self.reviewed_collapsed_directories
+        } else {
+            &mut self.collapsed_directories
+        };
+        if !directories.insert(path.clone()) {
+            directories.remove(&path);
         }
         self.persist_project_settings();
         cx.notify();
@@ -3232,21 +3407,19 @@ impl ReviewWorkspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .border_b_1()
-                    .border_color(rgb(BORDER))
                     .text_size(px(11.))
                     .text_color(rgb(TEXT))
-                    .child("FILES")
-                    .child(
-                        div()
-                            .text_color(rgb(MUTED))
-                            .child(visible_file_count.to_string()),
-                    )
+                    .child(div().id("files-section-toggle").h_full().flex().items_center().gap_1()
+                        .cursor_pointer().hover(|element| element.text_color(rgb(BLUE)))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_files_section(cx)))
+                        .child(if self.files_section_expanded { "▾" } else { "▸" })
+                        .child("FILES")
+                        .child(div().text_color(rgb(MUTED)).child(visible_file_count.to_string())))
                     .child(div().flex_1())
                     .child(self.review_all_files_button(cx))
                     .child(self.file_view_settings_button(cx)),
             )
-            .child(
+            .when(self.files_section_expanded, |this| this.child(
                 div()
                     .id("file-scroll")
                     .flex_1()
@@ -3255,7 +3428,20 @@ impl ReviewWorkspace {
                     .pt_1()
                     .overflow_scroll()
                     .child(self.file_list(cx)),
+            ))
+            .child(
+                div()
+                    .id("reviewed-files-resizer")
+                    .h(px(5.))
+                    .w_full()
+                    .flex_none()
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .flex()
+                    .items_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::start_reviewed_panel_drag))
+                    .child(div().h(px(1.)).w_full().bg(rgb(BORDER))),
             )
+            .child(self.reviewed_files_panel(cx))
             .child(
                 div()
                     .id("filtered-files-resizer")
@@ -3274,6 +3460,32 @@ impl ReviewWorkspace {
             .child(self.filtered_files_panel(window, cx))
     }
 
+    fn reviewed_files_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.reviewed_file_entries().len();
+        div()
+            .id("reviewed-files-panel")
+            .h(if self.reviewed_section_expanded { self.reviewed_panel_height } else { px(28.) })
+            .w_full()
+            .flex_none()
+            .when(self.reviewed_section_expanded && !self.files_section_expanded, |this| this.flex_1())
+            .flex()
+            .flex_col()
+            .bg(rgb(PANEL))
+            .child(div().h(px(28.)).px_3().flex_none().flex().items_center()
+                .text_size(px(11.)).text_color(rgb(MUTED))
+                .child(div().id("reviewed-section-toggle").h_full().flex().items_center().gap_1()
+                    .cursor_pointer().hover(|element| element.text_color(rgb(BLUE)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_reviewed_section(cx)))
+                    .child(if self.reviewed_section_expanded { "▾" } else { "▸" })
+                    .child(format!("REVIEWED · {count}"))))
+            .when(self.reviewed_section_expanded, |this| this.child(
+                div().id("reviewed-files-scroll").flex_1().px_2().pr(px(6.)).overflow_scroll()
+                    .when(count == 0, |this| this.child(div().px_1().pt_2().text_size(px(11.))
+                        .text_color(rgb(MUTED)).child("No reviewed files")))
+                    .child(self.reviewed_file_list(cx)),
+            ))
+    }
+
     fn filtered_files_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let indices = self.filtered_out_file_indices();
         let count = indices.len();
@@ -3281,22 +3493,27 @@ impl ReviewWorkspace {
         let filter_color = if active_filters > 0 { BLUE } else { MUTED };
         div()
             .id("filtered-files-panel")
-            .h(self.filtered_panel_height)
+            .h(if self.ignored_section_expanded { self.filtered_panel_height } else { px(28.) })
             .w_full()
             .flex_none()
+            .when(self.ignored_section_expanded && !self.files_section_expanded && !self.reviewed_section_expanded, |this| this.flex_1())
             .flex()
             .flex_col()
             .bg(rgb(PANEL))
             .child(div().h(px(28.)).px_3().flex().items_center()
                 .text_size(px(11.)).text_color(rgb(MUTED))
-                .child(format!("IGNORED · {count}"))
+                .child(div().id("ignored-section-toggle").h_full().flex().items_center().gap_1()
+                    .cursor_pointer().hover(|element| element.text_color(rgb(BLUE)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ignored_section(cx)))
+                    .child(if self.ignored_section_expanded { "▾" } else { "▸" })
+                    .child(format!("IGNORED · {count}")))
                 .child(div().flex_1())
                 .child(self.file_filter_toggle(false, filter_color, active_filters, cx)))
-            .when(self.show_file_filter, |this| {
+            .when(self.ignored_section_expanded && self.show_file_filter, |this| {
                 this.child(self.file_filter_panel(window, self.hidden_file_count(), cx))
                     .child(self.change_type_filter_bar(cx))
             })
-            .child(div().id("filtered-files-scroll").flex_1().px_2().pr(px(6.)).overflow_scroll()
+            .when(self.ignored_section_expanded, |this| this.child(div().id("filtered-files-scroll").flex_1().px_2().pr(px(6.)).overflow_scroll()
                 .when(count == 0, |this| this.child(div().px_1().pt_2().text_size(px(11.))
                     .text_color(rgb(MUTED)).child("No ignored files")))
                 .children(indices.into_iter().map(|index| {
@@ -3305,8 +3522,8 @@ impl ReviewWorkspace {
                         path: file.path.clone(),
                         model_index: Some(index),
                         is_changed: true,
-                    }, 0, true, &[], cx)
-                })))
+                    }, "ignored", 0, true, &[], cx)
+                }))))
     }
 
     fn file_filter_toggle(
@@ -3478,7 +3695,7 @@ impl ReviewWorkspace {
 
     fn file_view_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active =
-            self.show_file_view_menu || !self.show_only_changes || self.hide_deleted_entries;
+            self.show_file_view_menu || !self.show_only_changes || self.hide_deleted_entries || self.hide_reviewed_files;
         div()
             .id("file-view-settings-toggle")
             .size(px(24.))
@@ -3511,7 +3728,7 @@ impl ReviewWorkspace {
             .map(|file| &file.path)
             .collect::<Vec<_>>();
         let all_reviewed =
-            !paths.is_empty() && paths.iter().all(|path| self.reviewed_files.contains(*path));
+            !paths.is_empty() && paths.iter().all(|path| self.reviewed_files.contains_key(*path));
         div()
             .id("review-all-files")
             .size(px(24.))
@@ -3649,6 +3866,25 @@ impl ReviewWorkspace {
                             .child(if self.hide_deleted_entries { "✓" } else { "" }),
                     )
                     .child("Hide deleted entries"),
+            )
+            .child(
+                div()
+                    .id("hide-reviewed-files")
+                    .mx_1()
+                    .h(px(24.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT))
+                    .hover(|element| element.bg(rgb(0x3b4350)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_hide_reviewed_files(cx)))
+                    .child(div().w(px(16.)).flex_none().text_color(rgb(BLUE))
+                        .child(if self.hide_reviewed_files { "✓" } else { "" }))
+                    .child("Hide reviewed files"),
             )
     }
 

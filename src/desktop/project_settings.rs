@@ -11,6 +11,8 @@ use super::{layout::UnchangedSection, view::ReviewChangeFamily, DiffView, FileVi
 
 const FORMAT_VERSION: u32 = 1;
 
+fn default_expanded() -> bool { true }
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct StoredTab {
@@ -22,6 +24,7 @@ pub(super) struct StoredTab {
 #[serde(default)]
 pub(super) struct WorkspaceState {
     pub sidebar_width: Option<u32>,
+    pub reviewed_panel_height: Option<u32>,
     pub filtered_panel_height: Option<u32>,
     pub annotation_width: Option<u32>,
     pub outline_width: Option<u32>,
@@ -33,8 +36,16 @@ pub(super) struct WorkspaceState {
     pub file_view: FileView,
     pub show_only_changes: bool,
     pub hide_deleted_entries: bool,
+    pub hide_reviewed_files: bool,
+    #[serde(default = "default_expanded")]
+    pub files_section_expanded: bool,
+    pub reviewed_section_expanded: bool,
+    pub ignored_section_expanded: bool,
+    pub reviewed_section_preference_set: bool,
+    pub ignored_section_preference_set: bool,
     pub show_file_filter: bool,
     pub collapsed_directories: BTreeSet<String>,
+    pub reviewed_collapsed_directories: BTreeSet<String>,
     pub change_type_filters: BTreeSet<ReviewChangeFamily>,
     pub file_filters: Vec<String>,
     pub hide_unchanged_sections: bool,
@@ -42,7 +53,9 @@ pub(super) struct WorkspaceState {
     pub tabs: Vec<StoredTab>,
     pub selected_file: Option<String>,
     pub selected_change: usize,
+    #[serde(skip_serializing)]
     pub reviewed_files: BTreeSet<String>,
+    pub reviewed: BTreeMap<String, String>,
     pub radar_open: bool,
     pub radar_active: bool,
     pub radar_expand_all: bool,
@@ -56,6 +69,7 @@ impl Default for WorkspaceState {
     fn default() -> Self {
         Self {
             sidebar_width: None,
+            reviewed_panel_height: Some(160),
             filtered_panel_height: Some(180),
             annotation_width: None,
             outline_width: None,
@@ -67,8 +81,15 @@ impl Default for WorkspaceState {
             file_view: FileView::CompactTree,
             show_only_changes: true,
             hide_deleted_entries: false,
+            hide_reviewed_files: false,
+            files_section_expanded: true,
+            reviewed_section_expanded: false,
+            ignored_section_expanded: false,
+            reviewed_section_preference_set: false,
+            ignored_section_preference_set: false,
             show_file_filter: false,
             collapsed_directories: BTreeSet::new(),
+            reviewed_collapsed_directories: BTreeSet::new(),
             change_type_filters: BTreeSet::new(),
             file_filters: Vec::new(),
             hide_unchanged_sections: false,
@@ -77,6 +98,7 @@ impl Default for WorkspaceState {
             selected_file: None,
             selected_change: 0,
             reviewed_files: BTreeSet::new(),
+            reviewed: BTreeMap::new(),
             radar_open: false,
             radar_active: false,
             radar_expand_all: false,

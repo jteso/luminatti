@@ -489,6 +489,7 @@ impl ReviewWorkspace {
     pub(super) fn file_row(
         &self,
         file_entry: SidebarFileEntry,
+        section: &'static str,
         depth: usize,
         show_full_path: bool,
         ending_guides: &[usize],
@@ -514,11 +515,11 @@ impl ReviewWorkspace {
         let additions = file.map(|file| file.additions).unwrap_or_default();
         let deletions = file.map(|file| file.deletions).unwrap_or_default();
         let is_changed = file_entry.is_changed;
-        let reviewed = self.reviewed_files.contains(&file_entry.path);
+        let reviewed = self.reviewed_files.contains_key(&file_entry.path);
         let path = file_entry.path;
         let review_path = path.clone();
         div()
-            .id(gpui::SharedString::from(format!("file-{path}")))
+            .id(gpui::SharedString::from(format!("{section}-file-{path}")))
             .w_full()
             .pl(px(10. + depth as f32 * 14.))
             .h(px(22.))
@@ -578,7 +579,7 @@ impl ReviewWorkspace {
                         .text_color(rgb(MUTED)).child("Reviewed")))
                     .child(
                         div()
-                            .id(gpui::SharedString::from(format!("review-file-{review_path}")))
+                            .id(gpui::SharedString::from(format!("{section}-review-file-{review_path}")))
                             .w(px(24.))
                             .h_full()
                             .flex_none()
@@ -598,6 +599,7 @@ impl ReviewWorkspace {
 
     fn directory_row(
         &self,
+        section: &'static str,
         name: String,
         path: String,
         depth: usize,
@@ -606,7 +608,7 @@ impl ReviewWorkspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .id(gpui::SharedString::from(format!("directory-{path}")))
+            .id(gpui::SharedString::from(format!("{section}-directory-{path}")))
             .w_full()
             .pl(px(10. + depth as f32 * 14.))
             .h(px(22.))
@@ -619,7 +621,7 @@ impl ReviewWorkspace {
             .text_size(px(11.))
             .text_color(rgb(TEXT))
             .hover(|element| element.bg(rgb(0x2c3443)))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_directory(path.clone(), cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_directory(path.clone(), section == "reviewed", cx)))
             .children(Self::tree_indent_guides(depth, ending_guides))
             .child(Self::folder_icon(!collapsed))
             .child(div().truncate().child(name))
@@ -788,12 +790,20 @@ impl ReviewWorkspace {
     }
 
     pub(super) fn file_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let visible_files = self.sidebar_file_entries();
+        self.sidebar_file_list(self.sidebar_file_entries(), "files", &self.collapsed_directories, cx)
+    }
+
+    pub(super) fn reviewed_file_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sidebar_file_list(self.reviewed_file_entries(), "reviewed", &self.reviewed_collapsed_directories, cx)
+    }
+
+    fn sidebar_file_list(&self, visible_files: Vec<SidebarFileEntry>, section: &'static str,
+        collapsed_directories: &std::collections::HashSet<String>, cx: &mut Context<Self>) -> impl IntoElement {
         let entries: Vec<AnyElement> = match self.file_view {
             FileView::Flat => visible_files
                 .iter()
                 .cloned()
-                .map(|file| self.file_row(file, 0, true, &[], cx).into_any_element())
+                .map(|file| self.file_row(file, section, 0, true, &[], cx).into_any_element())
                 .collect(),
             FileView::Tree | FileView::CompactTree => {
                 let visible_paths = visible_files
@@ -802,7 +812,7 @@ impl ReviewWorkspace {
                     .collect::<Vec<_>>();
                 let entries = build_file_tree_entries(
                     &visible_paths,
-                    &self.collapsed_directories,
+                    collapsed_directories,
                     self.file_view == FileView::CompactTree,
                 );
                 let ending_guides = entries
@@ -826,11 +836,12 @@ impl ReviewWorkspace {
                             depth,
                             collapsed,
                         } => self
-                            .directory_row(name, path, depth, collapsed, &ending_guides, cx)
+                            .directory_row(section, name, path, depth, collapsed, &ending_guides, cx)
                             .into_any_element(),
                         FileTreeEntry::File { index, depth } => self
                             .file_row(
                                 visible_files[index].clone(),
+                                section,
                                 depth,
                                 false,
                                 &ending_guides,
@@ -1699,8 +1710,8 @@ impl ReviewWorkspace {
         let current_change = (total_changes > 0)
             .then_some(self.selected_change.saturating_add(1).min(total_changes))
             .unwrap_or(0);
-        let can_select_previous = current_change > 1;
-        let can_select_next = current_change < total_changes;
+        let can_select_previous = total_changes > 0 && (!self.change_navigation_active || current_change > 1);
+        let can_select_next = total_changes > 0 && (!self.change_navigation_active || current_change < total_changes);
         let can_toggle_diff_view = self.selected_file().is_some();
         let target_diff_view = match self.diff_view {
             DiffView::Split => DiffView::Unified,

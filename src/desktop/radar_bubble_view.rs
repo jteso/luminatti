@@ -670,19 +670,16 @@ impl ReviewWorkspace {
                             continue;
                         }
                         if r >= 1.2 {
-                            let mut fill_color = if node.directory {
+                            let highlighted = paint_selected.as_deref() == Some(node.path.as_str());
+                            let hovered = paint_hovered.as_deref() == Some(node.path.as_str());
+                            let hovered_file = hovered && !node.directory;
+                            let fill_color = if node.directory && hovered {
+                                0x25282e
+                            } else if node.directory {
                                 0x2b2e34
                             } else {
                                 bubble_color(node.change)
                             };
-                            let highlighted = paint_selected.as_deref() == Some(node.path.as_str());
-                            let hovered = paint_hovered.as_deref() == Some(node.path.as_str());
-                            let hovered_file = hovered && !node.directory;
-                            if node.directory && hovered {
-                                fill_color = 0x25282e;
-                            } else if highlighted {
-                                fill_color = 0x555b64;
-                            }
                             let related = paint_focus.as_ref().is_some_and(|focus| {
                                 !node.directory && focus.files.contains(&node.path)
                             });
@@ -748,11 +745,7 @@ impl ReviewWorkspace {
                                     size: size(px(2. * r), px(2. * r)),
                                 },
                                 px(r),
-                                rgb(if highlighted {
-                                    0x555b64
-                                } else {
-                                    bubble_color(node.change)
-                                }),
+                                rgb(bubble_color(node.change)),
                                 px(if hovered {
                                     1.8
                                 } else if highlighted {
